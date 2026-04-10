@@ -1,60 +1,97 @@
 const pool = require("../db/db");
 
 exports.createBooking = async (data, idempotencyKey) => {
-  const { roomId, title, organizerEmail, startTime, endTime } = data;
+  const client = await pool.connect();
 
-  const start = new Date(startTime);
-  const end = new Date(endTime);
+  try {
+    await client.query("BEGIN");
 
-  if (start >= end) throw new Error("startTime must be before endTime");
+    const { roomId, title, organizerEmail, startTime, endTime } = data;
 
-  const duration = (end - start) / (1000 * 60);
+    const start = new Date(startTime);
+    const end = new Date(endTime);
 
-  if (duration < 15 || duration > 240)
-    throw new Error("Booking must be 15 minutes to 4 hours");
+    if (start >= end) throw new Error("startTime must be before endTime");
 
-  if (idempotencyKey) {
-    const keyCheck = await pool.query(
-      "SELECT response FROM idempotency_keys WHERE key=$1",
-      [idempotencyKey],
+    const duration = (end - start) / (1000 * 60);
+    if (duration < 15 || duration > 240)
+      throw new Error("Booking must be 15 minutes to 4 hours");
+
+    // ✅ STEP 1: Idempotency check
+    if (idempotencyKey) {
+      const keyCheck = await client.query(
+        "SELECT * FROM idempotency_keys WHERE key=$1 FOR UPDATE",
+        [idempotencyKey],
+      );
+
+      if (keyCheck.rows.length) {
+        const record = keyCheck.rows[0];
+
+        if (record.status === "processing") {
+          throw new Error("Request in progress");
+        }
+
+        if (record.status === "completed") {
+          return record.response;
+        }
+      }
+
+      // ✅ mark as processing BEFORE booking
+      await client.query(
+        `INSERT INTO idempotency_keys(key, organizer, status)
+         VALUES($1,$2,'processing')`,
+        [idempotencyKey, organizerEmail],
+      );
+    }
+
+    // ✅ Room check
+    const room = await client.query("SELECT * FROM rooms WHERE id=$1", [
+      roomId,
+    ]);
+
+    if (!room.rows.length) throw new Error("ROOM_NOT_FOUND");
+
+    // ✅ Overlap check
+    const overlap = await client.query(
+      `SELECT * FROM bookings
+       WHERE room_id=$1
+       AND status='confirmed'
+       AND start_time < $2
+       AND end_time > $3`,
+      [roomId, endTime, startTime],
     );
 
-    if (keyCheck.rows.length) return keyCheck.rows[0].response;
-  }
+    if (overlap.rows.length) throw new Error("OVERLAP");
 
-  const room = await pool.query("SELECT * FROM rooms WHERE id=$1", [roomId]);
-
-  if (!room.rows.length) throw new Error("ROOM_NOT_FOUND");
-
-  const overlap = await pool.query(
-    `SELECT * FROM bookings
-     WHERE room_id=$1
-     AND status='confirmed'
-     AND start_time < $2
-     AND end_time > $3`,
-    [roomId, endTime, startTime],
-  );
-
-  if (overlap.rows.length) throw new Error("OVERLAP");
-
-  const result = await pool.query(
-    `INSERT INTO bookings(room_id,title,organizer_email,start_time,end_time,status)
-     VALUES($1,$2,$3,$4,$5,'confirmed')
-     RETURNING *`,
-    [roomId, title, organizerEmail, startTime, endTime],
-  );
-
-  const booking = result.rows[0];
-
-  if (idempotencyKey) {
-    await pool.query(
-      `INSERT INTO idempotency_keys(key,organizer,response)
-       VALUES($1,$2,$3)`,
-      [idempotencyKey, organizerEmail, booking],
+    // ✅ Insert booking
+    const result = await client.query(
+      `INSERT INTO bookings(room_id,title,organizer_email,start_time,end_time,status)
+       VALUES($1,$2,$3,$4,$5,'confirmed')
+       RETURNING *`,
+      [roomId, title, organizerEmail, startTime, endTime],
     );
-  }
 
-  return booking;
+    const booking = result.rows[0];
+
+    // ✅ mark completed
+    if (idempotencyKey) {
+      await client.query(
+        `UPDATE idempotency_keys
+         SET status='completed', response=$2
+         WHERE key=$1`,
+        [idempotencyKey, booking],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    return booking;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 };
 
 exports.getBookings = async (query) => {

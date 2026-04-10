@@ -1,0 +1,28 @@
+CREATE TABLE rooms(
+ id SERIAL PRIMARY KEY,
+ name TEXT UNIQUE,
+ capacity INT,
+ floor INT,
+ amenities TEXT[]
+);
+
+CREATE TABLE bookings(
+ id SERIAL PRIMARY KEY,
+ room_id INT REFERENCES rooms(id),
+ title TEXT,
+ organizer_email TEXT,
+ start_time TIMESTAMP,
+ end_time TIMESTAMP,
+ status TEXT
+);
+
+CREATE TABLE idempotency_keys(
+ key TEXT,
+ organizer TEXT,
+ response JSONB
+);
+
+ALTER TABLE idempotency_keys
+ADD COLUMN status TEXT;
+
+SELECT * FROM idempotency_keys
